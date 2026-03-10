@@ -330,7 +330,7 @@ const PluginAPI = {
      */
     async getPluginStore() {
         const response = await this.request('/plugins/store');
-        return response.data || [];
+        return response.data && response.data.plugins ? response.data.plugins : [];
     },
     
     /**
