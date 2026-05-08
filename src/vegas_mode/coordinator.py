@@ -378,9 +378,20 @@ class VegasModeCoordinator:
             if elapsed >= duration:
                 break
 
-            # Check for cycle completion
-            if self.render_pipeline.is_cycle_complete():
-                break
+            # NOTE: do NOT break on is_cycle_complete() here.
+            # When multi-display sync is active, breaking exits run_iteration()
+            # which causes a 2-3s delay before start_new_cycle() is called on
+            # the next run_iteration(). During that gap the scroll advances into
+            # the pre-roll zone, then start_new_cycle() resets it — producing a
+            # second visible jump on the follower display ~2.5s after the first.
+            #
+            # Instead, run_frame() handles cycle completion directly (it calls
+            # start_new_cycle() in the very next frame, 8ms later), collapsing
+            # the two events into a single clean transition.
+            #
+            # Without sync, the iteration now runs to its full duration and may
+            # cycle content multiple times within one iteration — acceptable for
+            # a continuous ticker.
 
         logger.info("Vegas iteration completed after %.1fs", time.time() - start_time)
         return True
