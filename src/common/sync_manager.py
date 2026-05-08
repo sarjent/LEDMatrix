@@ -325,6 +325,8 @@ class DisplaySyncManager:
                                     "Sync: leader rejected handshake — %s",
                                     self._error_message,
                                 )
+                            # Update status file so peer_compatible reflects the ack
+                            self.write_status_file()
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         pass
 

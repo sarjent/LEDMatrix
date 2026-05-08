@@ -279,6 +279,14 @@ class RenderPipeline:
         if self._cycle_complete:
             return True
 
+        # When multi-display sync is active, defer mid-cycle hot swaps until the
+        # cycle ends naturally. Hot swaps block the render loop for 15-30ms while
+        # the image is rebuilt, causing a freeze+jump that the follower perceives
+        # as a speed-up. Deferring to cycle boundaries keeps transitions clean.
+        # Staging buffer content is still pre-loaded; it just applies at cycle end.
+        if self.sync_manager is not None:
+            return False
+
         # Check if we need more content in the buffer
         buffer_status = self.stream_manager.get_buffer_status()
         if buffer_status['staging_count'] > 0:
