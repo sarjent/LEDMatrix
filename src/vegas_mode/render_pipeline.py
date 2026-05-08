@@ -52,6 +52,10 @@ class RenderPipeline:
         self.config = config
         self.display_manager = display_manager
         self.stream_manager = stream_manager
+        self.sync_manager = None        # Optional DisplaySyncManager — set by coordinator
+        self.sync_follower_left = True  # True = follower is LEFT of leader (default)
+        self._sync_send_interval = 1.0 / 90  # raw bytes are cheap; 90fps > follower render rate
+        self._last_sync_send = 0.0
 
         # Display dimensions (handle both property and method access patterns)
         self.display_width = (
@@ -220,6 +224,21 @@ class RenderPipeline:
             # Render to display
             self.display_manager.image = visible_frame
             self.display_manager.update_display()
+
+            # Multi-display sync: send the follower's portion of the Vegas ticker.
+            # Throttled to 30fps — PNG encode/decode at 125fps is too heavy on Pi.
+            # follower_left=True  → negative offset (content already scrolled off leader)
+            # follower_left=False → positive offset (follower is to the right)
+            if self.sync_manager:
+                now = time.time()
+                if now - self._last_sync_send >= self._sync_send_interval:
+                    self._last_sync_send = now
+                    sign = -1 if self.sync_follower_left else 1
+                    follower_frame = self.scroll_helper.get_portion_at(
+                        self.scroll_helper.scroll_position + sign * self.display_width
+                    )
+                    if follower_frame:
+                        self.sync_manager.send_frame(follower_frame)
 
             # Update scrolling state
             self.display_manager.set_scrolling_state(True)

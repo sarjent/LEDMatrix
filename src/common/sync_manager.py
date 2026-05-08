@@ -1,0 +1,449 @@
+"""
+Multi-Display Sync Manager
+
+Synchronizes scrolling content across two LED matrix display units over UDP.
+Runs at the core framework level — works with any plugin automatically.
+
+Roles:
+  standalone  No sync (default behavior)
+  leader      Drives scroll, sends rendered follower frames via UDP
+  follower    Receives frames from leader; falls back to own plugins when
+              the leader goes offline
+
+Compatibility rule: rows and cols must match between leader and follower.
+chain_length may differ — each display can have a different number of panels.
+
+Port default: 5765 (UDP). Open this port on both Pis if ufw is active:
+  sudo ufw allow 5765/udp
+"""
+
+import io
+import json
+import os
+import socket
+import struct
+import threading
+import time
+import logging
+from enum import Enum
+from typing import Optional
+import numpy as np
+from PIL import Image
+
+# Raw-frame wire format: 8-byte magic + 4-byte header + raw RGB pixels
+# Much faster than PNG: no encode/decode, negligible CPU, same UDP packet size
+_RAW_MAGIC = b'SYNC_RAW'
+_RAW_HEADER = struct.Struct('<HH')  # width, height (uint16 LE)
+
+
+SYNC_PORT = 5765
+HELLO_INTERVAL = 5.0       # follower broadcasts hello every 5 s
+HEARTBEAT_INTERVAL = 2.0   # follower sends heartbeat every 2 s
+PEER_TIMEOUT = 6.0         # leader: no heartbeat → follower gone
+LEADER_TIMEOUT = 6.0       # follower: no frame → leader gone
+STATUS_FILE = "/tmp/led_matrix_sync_status.json"
+
+
+class SyncRole(Enum):
+    STANDALONE = "standalone"
+    LEADER = "leader"
+    FOLLOWER = "follower"
+
+
+class LeaderState(Enum):
+    NO_PEER = "no_peer"
+    CONNECTED = "connected"
+    INCOMPATIBLE = "incompatible"
+
+
+class FollowerState(Enum):
+    STANDALONE = "standalone"
+    FOLLOWER = "follower"
+
+
+class DisplaySyncManager:
+    """
+    Core sync manager.  Instantiated by DisplayController based on config['sync'].
+    Leader sends compressed PNG frames to the follower after each render cycle.
+    Follower renders received frames; returns to own plugin stack when leader
+    goes offline.
+    """
+
+    def __init__(
+        self,
+        role_str: str,
+        cfg: dict,
+        hw_config: dict,
+        logger: logging.Logger,
+    ) -> None:
+        """
+        Args:
+            role_str:   "standalone" | "leader" | "follower"
+            cfg:        config['sync'] dict
+            hw_config:  config['display']['hardware'] dict (this Pi's own config)
+            logger:     framework logger
+        """
+        try:
+            self.role = SyncRole(role_str)
+        except ValueError:
+            logger.warning("Invalid sync role '%s', defaulting to standalone", role_str)
+            self.role = SyncRole.STANDALONE
+
+        self.logger = logger
+        self.port = int(cfg.get("port", SYNC_PORT))
+        self._hw_config = hw_config
+
+        # Leader state
+        self._leader_state = LeaderState.NO_PEER
+        self._peer_ip: Optional[str] = None
+        self._peer_compatible: bool = False
+        self._peer_chain: int = 0
+        self._last_heartbeat_time: float = 0.0
+        self._leader_width: int = 0  # set by display_controller after init
+
+        # Follower state
+        self._follower_state = FollowerState.STANDALONE
+        self._latest_frame: Optional[Image.Image] = None
+        self._last_leader_frame_time: float = 0.0
+        self._frame_lock = threading.Lock()
+        self._leader_ip: Optional[str] = None
+
+        self._error_message: Optional[str] = None
+        self._running = False
+        self._recv_sock: Optional[socket.socket] = None
+        self._send_sock: Optional[socket.socket] = None
+
+        if self.role == SyncRole.STANDALONE:
+            return
+
+        if self.role == SyncRole.LEADER:
+            self._start_leader()
+        elif self.role == SyncRole.FOLLOWER:
+            self._start_follower()
+
+    # ------------------------------------------------------------------ #
+    # Leader setup                                                         #
+    # ------------------------------------------------------------------ #
+
+    def _start_leader(self) -> None:
+        # Receive socket: listens for hello + heartbeat from follower
+        self._recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._recv_sock.bind(("", self.port))
+        self._recv_sock.settimeout(1.0)
+
+        # Send socket: unicast frames + hello_ack to follower
+        self._send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        self._running = True
+        threading.Thread(
+            target=self._leader_recv_loop, daemon=True, name="sync-leader-recv"
+        ).start()
+        threading.Thread(
+            target=self._leader_watchdog, daemon=True, name="sync-leader-watchdog"
+        ).start()
+        self.logger.info("Sync: leader started on UDP port %d", self.port)
+        self.write_status_file()
+
+    def _leader_recv_loop(self) -> None:
+        while self._running:
+            try:
+                data, addr = self._recv_sock.recvfrom(1024)
+                sender_ip = addr[0]
+                try:
+                    msg = json.loads(data.decode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                t = msg.get("t")
+                if t == "hello":
+                    self._handle_hello(msg, sender_ip)
+                elif t == "hb":
+                    if self._peer_ip == sender_ip:
+                        self._last_heartbeat_time = time.time()
+            except socket.timeout:
+                continue
+            except Exception as exc:
+                self.logger.debug("Sync leader recv error: %s", exc)
+
+    def _handle_hello(self, msg: dict, sender_ip: str) -> None:
+        hw = self._hw_config
+        local_rows = hw.get("rows", 32)
+        local_cols = hw.get("cols", 64)
+        peer_rows = int(msg.get("rows", 0))
+        peer_cols = int(msg.get("cols", 0))
+        peer_chain = int(msg.get("chain", 1))
+
+        compatible = peer_rows == local_rows and peer_cols == local_cols
+
+        self._peer_ip = sender_ip
+        self._peer_compatible = compatible
+        self._peer_chain = peer_chain
+        self._last_heartbeat_time = time.time()
+
+        prev_state = self._leader_state
+        if compatible:
+            if prev_state != LeaderState.CONNECTED:
+                self.logger.info(
+                    "Sync: follower connected at %s (chain=%d)", sender_ip, peer_chain
+                )
+            self._leader_state = LeaderState.CONNECTED
+            self._error_message = None
+        else:
+            self._leader_state = LeaderState.INCOMPATIBLE
+            self._error_message = (
+                f"Incompatible panels: follower is {peer_cols}x{peer_rows}, "
+                f"leader is {local_cols}x{local_rows}. "
+                f"rows and cols must match between displays."
+            )
+            self.logger.error("Sync: %s", self._error_message)
+
+        if self._leader_state != prev_state:
+            self.write_status_file()
+
+        ack = json.dumps({
+            "t": "hello_ack",
+            "compatible": compatible,
+            "leader_width": self._leader_width,
+            "error": self._error_message,
+        }).encode("utf-8")
+        try:
+            self._send_sock.sendto(ack, (sender_ip, self.port))
+        except Exception as exc:
+            self.logger.debug("Sync: hello_ack send failed: %s", exc)
+
+    def _leader_watchdog(self) -> None:
+        while self._running:
+            time.sleep(1.0)
+            if self._leader_state == LeaderState.CONNECTED:
+                if time.time() - self._last_heartbeat_time > PEER_TIMEOUT:
+                    self.logger.info(
+                        "Sync: follower heartbeat timeout — peer disconnected"
+                    )
+                    self._leader_state = LeaderState.NO_PEER
+                    self._peer_ip = None
+                    self._peer_compatible = False
+                    self.write_status_file()
+
+    def send_frame(self, image: Image.Image) -> None:
+        """Leader: send a rendered frame to the follower as raw RGB bytes.
+        Raw format is orders of magnitude faster than PNG on Pi hardware —
+        no encode on sender, no decode on receiver.
+        Packet: 8-byte magic + 4-byte (width, height) header + raw RGB bytes.
+        """
+        if self.role != SyncRole.LEADER:
+            return
+        if self._leader_state != LeaderState.CONNECTED or not self._peer_ip:
+            return
+        try:
+            arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+            header = _RAW_MAGIC + _RAW_HEADER.pack(image.width, image.height)
+            data = header + arr.tobytes()
+            if len(data) <= 65000:
+                self._send_sock.sendto(data, (self._peer_ip, self.port))
+        except Exception as exc:
+            self.logger.debug("Sync: frame send error: %s", exc)
+
+    def set_leader_width(self, width: int) -> None:
+        """Called by DisplayController once display_manager.width is known."""
+        self._leader_width = width
+
+    # ------------------------------------------------------------------ #
+    # Follower setup                                                       #
+    # ------------------------------------------------------------------ #
+
+    def _start_follower(self) -> None:
+        # Receive socket: listens for frames + hello_ack from leader
+        self._recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._recv_sock.bind(("", self.port))
+        self._recv_sock.settimeout(0.1)
+
+        # Send socket: broadcasts hello + heartbeat
+        self._send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+        self._running = True
+        threading.Thread(
+            target=self._follower_recv_loop, daemon=True, name="sync-follower-recv"
+        ).start()
+        threading.Thread(
+            target=self._follower_announce_loop, daemon=True, name="sync-follower-announce"
+        ).start()
+        threading.Thread(
+            target=self._follower_watchdog, daemon=True, name="sync-follower-watchdog"
+        ).start()
+        self.logger.info(
+            "Sync: follower started on UDP port %d — broadcasting hello every %.0fs",
+            self.port,
+            HELLO_INTERVAL,
+        )
+        self.write_status_file()
+
+    def _follower_recv_loop(self) -> None:
+        while self._running:
+            try:
+                data, addr = self._recv_sock.recvfrom(65535)
+                sender_ip = addr[0]
+
+                if len(data) > 512:
+                    # Raw RGB frame: magic(8) + width/height(4) + pixels
+                    try:
+                        if data[:8] == _RAW_MAGIC:
+                            w, h = _RAW_HEADER.unpack(data[8:12])
+                            raw = data[12:]
+                            img = Image.frombuffer(
+                                "RGB", (w, h), raw, "raw", "RGB", 0, 1
+                            )
+                        else:
+                            # Fallback: try legacy PNG
+                            img = Image.open(io.BytesIO(data))
+                            img.load()
+                        with self._frame_lock:
+                            self._latest_frame = img
+                        self._last_leader_frame_time = time.time()
+                        self._leader_ip = sender_ip
+
+                        if self._follower_state == FollowerState.STANDALONE:
+                            self._follower_state = FollowerState.FOLLOWER
+                            self.logger.info(
+                                "Sync: leader active at %s — switching to follower mode",
+                                sender_ip,
+                            )
+                            self.write_status_file()
+                    except Exception as exc:
+                        self.logger.debug("Sync: frame decode error: %s", exc)
+                else:
+                    # Control message
+                    try:
+                        msg = json.loads(data.decode("utf-8"))
+                        if msg.get("t") == "hello_ack":
+                            self._leader_ip = sender_ip
+                            self._peer_compatible = msg.get("compatible", False)
+                            self._error_message = msg.get("error")
+                            if not self._peer_compatible and self._error_message:
+                                self.logger.error(
+                                    "Sync: leader rejected handshake — %s",
+                                    self._error_message,
+                                )
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        pass
+
+            except socket.timeout:
+                continue
+            except Exception as exc:
+                self.logger.debug("Sync follower recv error: %s", exc)
+
+    def _follower_announce_loop(self) -> None:
+        hw = self._hw_config
+        hello = json.dumps({
+            "t": "hello",
+            "rows": hw.get("rows", 32),
+            "cols": hw.get("cols", 64),
+            "chain": hw.get("chain_length", 1),
+        }).encode("utf-8")
+        heartbeat = json.dumps({"t": "hb"}).encode("utf-8")
+        dest = ("<broadcast>", self.port)
+
+        last_hello = 0.0
+        last_hb = 0.0
+
+        while self._running:
+            now = time.time()
+            if now - last_hello >= HELLO_INTERVAL:
+                try:
+                    self._send_sock.sendto(hello, dest)
+                    last_hello = now
+                except Exception as exc:
+                    self.logger.debug("Sync: hello broadcast error: %s", exc)
+            if now - last_hb >= HEARTBEAT_INTERVAL:
+                try:
+                    self._send_sock.sendto(heartbeat, dest)
+                    last_hb = now
+                except Exception as exc:
+                    self.logger.debug("Sync: heartbeat error: %s", exc)
+            time.sleep(0.5)
+
+    def _follower_watchdog(self) -> None:
+        while self._running:
+            time.sleep(1.0)
+            if self._follower_state == FollowerState.FOLLOWER:
+                if time.time() - self._last_leader_frame_time > LEADER_TIMEOUT:
+                    self.logger.info(
+                        "Sync: leader frame timeout — returning to standalone mode"
+                    )
+                    self._follower_state = FollowerState.STANDALONE
+                    with self._frame_lock:
+                        self._latest_frame = None
+                    self.write_status_file()
+
+    # ------------------------------------------------------------------ #
+    # Public API                                                           #
+    # ------------------------------------------------------------------ #
+
+    def is_follower_active(self) -> bool:
+        """True when this Pi is in active follower mode (receiving frames)."""
+        return (
+            self.role == SyncRole.FOLLOWER
+            and self._follower_state == FollowerState.FOLLOWER
+        )
+
+    def get_latest_frame(self) -> Optional[Image.Image]:
+        """Follower: return the most recently received frame."""
+        with self._frame_lock:
+            return self._latest_frame
+
+    def get_status(self) -> dict:
+        """Return sync state dict for the web API status endpoint."""
+        hw = self._hw_config
+        base = {
+            "role": self.role.value,
+            "port": self.port,
+            "local_rows": hw.get("rows", 32),
+            "local_cols": hw.get("cols", 64),
+            "local_chain": hw.get("chain_length", 1),
+        }
+
+        if self.role == SyncRole.STANDALONE:
+            return {**base, "state": "standalone"}
+
+        if self.role == SyncRole.LEADER:
+            return {
+                **base,
+                "state": self._leader_state.value,
+                "peer_ip": self._peer_ip,
+                "peer_compatible": self._peer_compatible,
+                "peer_chain": self._peer_chain,
+                "leader_width": self._leader_width,
+                "error": self._error_message,
+            }
+
+        # Follower
+        return {
+            **base,
+            "state": self._follower_state.value,
+            "leader_ip": self._leader_ip,
+            "peer_compatible": self._peer_compatible,
+            "error": self._error_message,
+        }
+
+    def write_status_file(self) -> None:
+        """Write current sync status to STATUS_FILE for the web UI to read."""
+        try:
+            status = self.get_status()
+            status["ts"] = time.time()
+            tmp = STATUS_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(status, f)
+            os.replace(tmp, STATUS_FILE)
+        except Exception as exc:
+            self.logger.debug("Sync: status file write error: %s", exc)
+
+    def stop(self) -> None:
+        """Shut down threads and close sockets."""
+        self._running = False
+        for sock in (self._recv_sock, self._send_sock):
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass

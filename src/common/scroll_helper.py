@@ -369,6 +369,26 @@ class ScrollHelper:
                 frame_array = self.cached_array[:, :self.display_width]
                 return Image.fromarray(frame_array)
     
+    def get_portion_at(self, pixel_x: float) -> Optional[Image.Image]:
+        """
+        Return a display_width slice of the cached scroll image at an arbitrary
+        pixel offset.  Used by the multi-display sync system so the leader can
+        render the follower's portion of the scroll without advancing scroll state.
+
+        Args:
+            pixel_x: Left edge of the desired slice in scroll-image coordinates.
+                     Wrap-around is handled automatically.
+
+        Returns:
+            PIL Image of size (display_width, display_height), or None if no
+            cached image is available yet.
+        """
+        if self.cached_array is None or self.total_scroll_width == 0:
+            return None
+        start_x = int(pixel_x) % self.total_scroll_width
+        end_x = start_x + self.display_width
+        return self._get_visible_portion_integer(start_x, end_x)
+
     def _get_visible_portion_subpixel(self, start_x_int: int, fractional: float) -> Image.Image:
         """
         Get visible portion with sub-pixel interpolation for smooth scrolling.

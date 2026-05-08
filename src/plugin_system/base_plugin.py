@@ -361,6 +361,36 @@ class BasePlugin(ABC):
         return [self.plugin_id]
 
     # -------------------------------------------------------------------------
+    # Multi-display sync support
+    # -------------------------------------------------------------------------
+    def get_offset_frame(self, pixel_offset: int):
+        """
+        Return a rendered frame shifted right by pixel_offset pixels.
+
+        The multi-display sync system calls this on the leader after each
+        render so it can send the follower's portion of the scroll without
+        any additional plugin logic.
+
+        Plugins that use ScrollHelper should override this:
+
+            def get_offset_frame(self, pixel_offset):
+                return self.scroll_helper.get_portion_at(
+                    self.scroll_helper.scroll_position + pixel_offset
+                )
+
+        The default returns None, which causes the leader to mirror its own
+        current frame to the follower (suitable for static / non-scroll plugins).
+
+        Args:
+            pixel_offset: How many pixels to the right of the current scroll
+                          position the follower's display begins.
+
+        Returns:
+            PIL Image or None
+        """
+        return None
+
+    # -------------------------------------------------------------------------
     # Vegas scroll mode support
     # -------------------------------------------------------------------------
     def get_vegas_content(self) -> Optional[Any]:

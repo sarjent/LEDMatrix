@@ -34,6 +34,7 @@ schema_manager = None
 operation_queue = None
 plugin_state_manager = None
 operation_history = None
+sync_manager = None  # Optional DisplaySyncManager instance (set by app.py if available)
 
 # Get project root directory (web_interface/../..)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -829,6 +830,26 @@ def save_main_config():
                     vegas_config['excluded_plugins'] = list(parsed) if isinstance(parsed, (list, tuple)) else []
                 except (json.JSONDecodeError, TypeError, ValueError):
                     vegas_config['excluded_plugins'] = []
+
+        # Handle multi-display sync settings
+        sync_fields = ['sync_role', 'sync_port']
+        if any(k in data for k in sync_fields):
+            if 'sync' not in current_config:
+                current_config['sync'] = {}
+            SYNC_ROLE_ALLOWED = {'standalone', 'leader', 'follower'}
+            if 'sync_role' in data:
+                role_val = str(data['sync_role']).lower()
+                if role_val not in SYNC_ROLE_ALLOWED:
+                    return jsonify({'status': 'error', 'message': f"Invalid sync role '{role_val}'. Must be one of: standalone, leader, follower"}), 400
+                current_config['sync']['role'] = role_val
+            if 'sync_port' in data:
+                try:
+                    port_val = int(data['sync_port'])
+                    if not (1024 <= port_val <= 65535):
+                        return jsonify({'status': 'error', 'message': "sync_port must be between 1024 and 65535"}), 400
+                    current_config['sync']['port'] = port_val
+                except (ValueError, TypeError):
+                    return jsonify({'status': 'error', 'message': "sync_port must be an integer"}), 400
 
         # Handle display durations
         duration_fields = [k for k in data.keys() if k.endswith('_duration') or k in ['default_duration', 'transition_duration']]
@@ -6459,6 +6480,43 @@ def get_logs():
             'status': 'error',
             'message': f'Error fetching logs: {str(e)}'
         }), 500
+
+# Multi-Display Sync Endpoints
+@api_v3.route('/sync/status', methods=['GET'])
+def get_sync_status():
+    """Return live multi-display sync status written by the display process."""
+    import os as _os
+    status_file = "/tmp/led_matrix_sync_status.json"
+    # Also surface config so the UI can show the configured role even before
+    # the display process has written a status file.
+    cfg_role = "standalone"
+    cfg_port = 5765
+    if api_v3.config_manager:
+        try:
+            cfg = api_v3.config_manager.load_config().get("sync", {})
+            cfg_role = cfg.get("role", "standalone")
+            cfg_port = int(cfg.get("port", 5765))
+        except Exception:
+            pass
+
+    if _os.path.exists(status_file):
+        try:
+            with open(status_file) as f:
+                live = json.load(f)
+            return jsonify({"status": "success", "data": live})
+        except Exception:
+            pass
+
+    # Status file not yet written — return config-only placeholder
+    return jsonify({
+        "status": "success",
+        "data": {
+            "role": cfg_role,
+            "port": cfg_port,
+            "state": "starting",
+        }
+    })
+
 
 # WiFi Management Endpoints
 @api_v3.route('/wifi/status', methods=['GET'])

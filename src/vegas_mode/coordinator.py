@@ -131,6 +131,20 @@ class VegasModeCoordinator:
         """Check if Vegas mode is currently running."""
         return self._is_active
 
+    def set_sync_manager(self, sync_manager, follower_position: str = "left") -> None:
+        """
+        Attach a DisplaySyncManager so Vegas mode sends the follower's portion
+        of the ticker to the second display on every rendered frame.
+
+        Args:
+            sync_manager:       DisplaySyncManager instance, or None to disable sync
+            follower_position:  "left" (default) or "right" — physical position of
+                                the follower display relative to the leader
+        """
+        if self.render_pipeline:
+            self.render_pipeline.sync_manager = sync_manager
+            self.render_pipeline.sync_follower_left = (follower_position == "left")
+
     def set_live_priority_checker(self, checker: Callable[[], Optional[str]]) -> None:
         """
         Set the callback for checking live priority content.
@@ -574,6 +588,11 @@ class VegasModeCoordinator:
 
                 if self._check_live_priority():
                     logger.info("Static pause interrupted by live priority")
+                    return False
+
+                # Yield immediately if multi-display follower mode becomes active
+                if self._interrupt_check and self._interrupt_check():
+                    logger.info("Static pause interrupted by sync follower mode")
                     return False
 
                 # Sleep in small increments to remain responsive

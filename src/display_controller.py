@@ -16,6 +16,7 @@ from src.config_service import ConfigService
 from src.cache_manager import CacheManager
 from src.font_manager import FontManager
 from src.logging_config import get_logger
+from src.common.sync_manager import DisplaySyncManager, SyncRole
 
 # Get logger with consistent configuration
 logger = get_logger(__name__)
@@ -66,7 +67,30 @@ class DisplayController:
         config_time = time.time()
         self.display_manager = DisplayManager(self.config)
         logger.info("DisplayManager initialized in %.3f seconds", time.time() - config_time)
-        
+
+        # Initialize multi-display sync (standalone by default — no-op unless configured)
+        sync_cfg = self.config.get("sync", {})
+        hw_cfg = self.config.get("display", {}).get("hardware", {})
+        self.sync_manager = DisplaySyncManager(
+            role_str=sync_cfg.get("role", "standalone"),
+            cfg=sync_cfg,
+            hw_config=hw_cfg,
+            logger=logger,
+        )
+        # Tell the leader its own physical display width so it can include it in hello_ack
+        if self.sync_manager.role == SyncRole.LEADER:
+            self.sync_manager.set_leader_width(self.display_manager.width)
+
+        # Follower mode: gate update_display() so background plugin threads
+        # cannot write to hardware — only our render loop is permitted.
+        if self.sync_manager.role == SyncRole.FOLLOWER:
+            _real_update = self.display_manager.update_display
+            _dm = self.display_manager
+            def _follower_gated_update():
+                if getattr(_dm, '_sync_render_allowed', False):
+                    _real_update()
+            self.display_manager.update_display = _follower_gated_update
+
         # Initialize Font Manager
         font_time = time.time()
         self.font_manager = FontManager(self.config)
@@ -392,11 +416,17 @@ class DisplayController:
             # Set up live priority checker
             self.vegas_coordinator.set_live_priority_checker(self._check_live_priority)
 
-            # Set up interrupt checker for on-demand/wifi status
+            # Set up interrupt checker for on-demand/wifi status and follower mode
+            def _vegas_interrupt():
+                return self._check_vegas_interrupt() or self.sync_manager.is_follower_active()
             self.vegas_coordinator.set_interrupt_checker(
-                self._check_vegas_interrupt,
+                _vegas_interrupt,
                 check_interval=10  # Check every 10 frames (~80ms at 125 FPS)
             )
+
+            # Wire multi-display sync into Vegas render pipeline
+            follower_pos = self.config.get("sync", {}).get("follower_position", "left")
+            self.vegas_coordinator.set_sync_manager(self.sync_manager, follower_pos)
 
             logger.info("Vegas mode coordinator initialized")
 
@@ -673,6 +703,53 @@ class DisplayController:
                 self.plugin_manager.run_scheduled_updates()
             except Exception:  # pylint: disable=broad-except
                 logger.exception("Error running scheduled plugin updates")
+
+    _FOLLOWER_SEND_INTERVAL = 1.0 / 90  # raw bytes are cheap; 90fps > follower render rate
+
+    def _send_follower_frame(self, plugin_instance) -> None:
+        """Leader: generate and send the follower's portion of the current frame.
+
+        The follower is physically to the LEFT of the leader in a right-to-left
+        scrolling ticker, so it shows content at scroll_position - display_width
+        (content that already scrolled off the leader's left edge).
+        Set sync.follower_position = "right" in config to invert this.
+        """
+        if not (self.sync_manager and self.sync_manager.role == SyncRole.LEADER):
+            return
+        # Throttle to 30fps — PNG encode/decode at 125fps is too heavy on Pi
+        now = time.time()
+        if now - getattr(self, '_last_follower_send', 0) < self._FOLLOWER_SEND_INTERVAL:
+            return
+        self._last_follower_send = now
+
+        follower_frame = None
+        width = self.display_manager.width
+        sync_cfg = self.config.get("sync", {})
+        sign = -1 if sync_cfg.get("follower_position", "left") == "left" else 1
+        offset = sign * width
+
+        # 1. Explicit hook — plugin opted in with get_offset_frame()
+        try:
+            follower_frame = plugin_instance.get_offset_frame(offset)
+        except Exception:
+            pass
+
+        # 2. Auto-detect — plugin has a scroll_helper (standard pattern for all
+        #    scroll plugins). Works with zero plugin code changes.
+        if follower_frame is None:
+            try:
+                sh = getattr(plugin_instance, 'scroll_helper', None)
+                if sh is not None:
+                    follower_frame = sh.get_portion_at(sh.scroll_position + offset)
+            except Exception:
+                pass
+
+        # 3. Mirror fallback — static plugins (clock, weather) show same frame
+        if follower_frame is None:
+            follower_frame = self.display_manager.image
+
+        if follower_frame is not None:
+            self.sync_manager.send_frame(follower_frame)
 
     def _sleep_with_plugin_updates(self, duration: float, tick_interval: float = 1.0):
         """Sleep while continuing to service plugin update schedules."""
@@ -1309,6 +1386,36 @@ class DisplayController:
                 # Plugins update on their own schedules - no forced sync updates needed
                 # Each plugin has its own update_interval and background services
                 
+                # Multi-display sync: follower mode — render frames received from leader.
+                # Plugin update() threads still run (via _tick_plugin_updates above) so
+                # data is fresh when we return to standalone if the leader goes offline.
+                if self.sync_manager.is_follower_active():
+                    # Render the newest leader frame.
+                    # Gate ensures only this block can call update_display() —
+                    # background plugin threads are blocked from the hardware.
+                    frame = self.sync_manager.get_latest_frame()
+                    if frame is not None:
+                        self._follower_last_frame = frame
+                    display_frame = getattr(self, '_follower_last_frame', None)
+                    if display_frame is not None:
+                        self.display_manager.image = display_frame
+                        self.display_manager._sync_render_allowed = True
+                        self.display_manager.update_display()
+                        self.display_manager._sync_render_allowed = False
+                    # Precision deadline: compensate for update_display() cost
+                    # so the render rate stays at exactly 60fps regardless of
+                    # how long the hardware push took.
+                    _deadline = getattr(self, '_follower_deadline', None)
+                    _now = time.perf_counter()
+                    if _deadline is None or _now > _deadline + 0.1:
+                        _deadline = _now  # resync after long gap
+                    _deadline += 1.0 / 60
+                    self._follower_deadline = _deadline
+                    _sleep = _deadline - time.perf_counter()
+                    if _sleep > 0:
+                        time.sleep(_sleep)
+                    continue
+
                 # Process any deferred updates that may have accumulated
                 # This also cleans up expired updates to prevent memory leaks
                 self.display_manager.process_deferred_updates()
@@ -1741,6 +1848,9 @@ class DisplayController:
                                 except Exception:  # pylint: disable=broad-except
                                     logger.exception("Error during display update")
 
+                                # Multi-display sync: send follower frame after each render
+                                self._send_follower_frame(manager_to_display)
+
                                 time.sleep(display_interval)
                                 self._tick_plugin_updates()
                                 self._poll_on_demand_requests()
@@ -1806,6 +1916,9 @@ class DisplayController:
                                             logger.debug("Display returned False for %s (dynamic duration enabled), continuing loop", active_mode)
                                 except Exception:  # pylint: disable=broad-except
                                     logger.exception("Error during display update")
+
+                                # Multi-display sync: send follower frame after each render
+                                self._send_follower_frame(manager_to_display)
 
                                 self._poll_on_demand_requests()
                                 self._check_on_demand_expiration()
