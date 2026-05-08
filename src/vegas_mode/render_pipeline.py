@@ -297,14 +297,37 @@ class RenderPipeline:
             True if swap occurred
         """
         try:
+            # Snapshot position before swap so we can reposition after.
+            # The new image has completely different content — if scroll_position
+            # is left unchanged it lands at an arbitrary mid-content point in the
+            # new image, causing a visible jump on both displays.
+            old_width = self.scroll_helper.total_scroll_width
+            old_pos = self.scroll_helper.scroll_position
+
             # Process any pending updates
             self.stream_manager.process_updates()
             self.stream_manager.swap_buffers()
 
             # Recompose with updated content
             if self.compose_scroll_content():
+                # Map scroll position proportionally into the new image width so
+                # we resume at the same relative progress through the content.
+                # This keeps the visual tempo consistent and avoids the jump that
+                # occurred when old scroll_position landed arbitrarily in new image.
+                new_width = self.scroll_helper.total_scroll_width
+                if old_width > 0 and new_width > 0:
+                    ratio = (old_pos % old_width) / old_width
+                    self.scroll_helper.scroll_position = ratio * new_width
+                else:
+                    self.scroll_helper.scroll_position = 0.0
+
                 self.stats['hot_swaps'] += 1
-                logger.debug("Hot-swap completed")
+                logger.debug(
+                    "Hot-swap completed: scroll repositioned %.0f→%.0f (%.1f%% of new %dpx image)",
+                    old_pos, self.scroll_helper.scroll_position,
+                    (self.scroll_helper.scroll_position / new_width * 100) if new_width else 0,
+                    new_width,
+                )
                 return True
 
             return False
