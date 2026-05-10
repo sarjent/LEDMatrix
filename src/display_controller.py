@@ -1445,27 +1445,10 @@ class DisplayController:
                 # Plugin update() threads still run (via _tick_plugin_updates above) so
                 # data is fresh when we return to standalone if the leader goes offline.
                 if self.sync_manager.is_follower_active():
-                    # Vegas path: leader sends scroll_x, follower renders locally.
-                    # No pixel data crosses the network — content changes on the
-                    # leader are completely invisible because the follower uses its
-                    # own scroll image (rebuilt in sync with the leader's new cycles).
-                    scroll_x = self.sync_manager.get_latest_scroll_x()
-                    if scroll_x is not None and self.vegas_coordinator:
-                        rp = self.vegas_coordinator.render_pipeline
-                        if rp.scroll_helper.cached_image is not None:
-                            sync_cfg = self.config.get("sync", {})
-                            sign = -1 if sync_cfg.get("follower_position", "left") == "left" else 1
-                            rp.scroll_helper.scroll_position = (
-                                scroll_x + sign * self.display_manager.width
-                            )
-                            frame = rp.scroll_helper.get_visible_portion()
-                            if frame is not None:
-                                self._follower_last_frame = frame
-                    else:
-                        # Fallback: pixel frame from leader (non-Vegas static content)
-                        frame = self.sync_manager.get_latest_frame()
-                        if frame is not None:
-                            self._follower_last_frame = frame
+                    # Render the latest pixel frame received from the leader.
+                    frame = self.sync_manager.get_latest_frame()
+                    if frame is not None:
+                        self._follower_last_frame = frame
 
                     display_frame = getattr(self, '_follower_last_frame', None)
                     if display_frame is not None:

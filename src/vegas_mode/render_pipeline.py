@@ -225,15 +225,17 @@ class RenderPipeline:
             self.display_manager.image = visible_frame
             self.display_manager.update_display()
 
-            # Multi-display sync (Vegas mode): send the scroll position to the follower.
-            # The follower renders from its own local Vegas pipeline at
-            # scroll_x - display_width — no pixel data crosses the network, so
-            # start_new_cycle() content changes are completely invisible to the follower.
+            # Multi-display sync: send the follower's offset frame as raw bytes.
             if self.sync_manager:
                 now = time.time()
                 if now - self._last_sync_send >= self._sync_send_interval:
                     self._last_sync_send = now
-                    self.sync_manager.send_scroll_x(self.scroll_helper.scroll_position)
+                    sign = -1 if self.sync_follower_left else 1
+                    follower_frame = self.scroll_helper.get_portion_at(
+                        self.scroll_helper.scroll_position + sign * self.display_width
+                    )
+                    if follower_frame:
+                        self.sync_manager.send_frame(follower_frame)
 
             # Update scrolling state
             self.display_manager.set_scrolling_state(True)
