@@ -233,19 +233,10 @@ class RenderPipeline:
                 now = time.time()
                 if now - self._last_sync_send >= self._sync_send_interval:
                     self._last_sync_send = now
-                    pos = self.scroll_helper.scroll_position
-                    if pos < self.display_width:
-                        # Pre-roll phase: scroll_position hasn't advanced far enough
-                        # for the offset to be valid yet. Computing pos - display_width
-                        # would wrap to near the end of the image, causing two visible
-                        # jumps per cycle reset. Mirror the leader's frame instead until
-                        # the offset becomes meaningful (takes ~2.5s at typical speed).
-                        follower_frame = visible_frame
-                    else:
-                        sign = -1 if self.sync_follower_left else 1
-                        follower_frame = self.scroll_helper.get_portion_at(
-                            pos + sign * self.display_width
-                        )
+                    sign = -1 if self.sync_follower_left else 1
+                    follower_frame = self.scroll_helper.get_portion_at(
+                        self.scroll_helper.scroll_position + sign * self.display_width
+                    )
                     if follower_frame:
                         self.sync_manager.send_frame(follower_frame)
 

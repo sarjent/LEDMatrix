@@ -736,16 +736,11 @@ class DisplayController:
 
         # 2. Auto-detect — plugin has a scroll_helper (standard pattern for all
         #    scroll plugins). Works with zero plugin code changes.
-        #    Guard: if scroll_position < display_width the negative offset wraps
-        #    to near the end of the image — mirror leader instead (pre-roll phase).
         if follower_frame is None:
             try:
                 sh = getattr(plugin_instance, 'scroll_helper', None)
                 if sh is not None:
-                    if sh.scroll_position >= width:
-                        follower_frame = sh.get_portion_at(sh.scroll_position + offset)
-                    else:
-                        follower_frame = self.display_manager.image
+                    follower_frame = sh.get_portion_at(sh.scroll_position + offset)
             except Exception:
                 pass
 
