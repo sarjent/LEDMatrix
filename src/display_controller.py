@@ -443,6 +443,17 @@ class DisplayController:
 
             logger.info("Vegas mode coordinator initialized")
 
+            # Follower: now that Vegas is ready, build the initial scroll image.
+            # We can't wait for the "nc" callback since it fires before plugins
+            # are loaded. Trigger the rebuild directly now that we're ready.
+            if self.sync_manager.role == SyncRole.FOLLOWER:
+                import threading as _t
+                _t.Thread(
+                    target=self._follower_rebuild_scroll_image,
+                    daemon=True,
+                    name="sync-follower-init-rebuild"
+                ).start()
+
         except Exception as e:
             logger.error("Failed to initialize Vegas mode: %s", e, exc_info=True)
             self.vegas_coordinator = None
@@ -720,16 +731,35 @@ class DisplayController:
     _FOLLOWER_SEND_INTERVAL = 1.0 / 90  # raw bytes are cheap; 90fps > follower render rate
 
     def _follower_rebuild_scroll_image(self) -> None:
-        """Follower: rebuild the local Vegas scroll image when the leader starts a new cycle.
-        Both Pis call start_new_cycle() together so they build from the same fresh plugin data.
-        Runs in a background thread — does not block the 60fps render loop.
+        """Follower: rebuild the local Vegas scroll image so both Pis render from
+        the same fresh plugin data. Called at startup (after Vegas initializes)
+        and each time the leader broadcasts a new-cycle signal. Runs in a daemon
+        thread so it never blocks the 60fps render loop.
         """
         try:
-            if self.vegas_coordinator and self.vegas_coordinator.render_pipeline:
-                self.vegas_coordinator.render_pipeline.start_new_cycle()
-                logger.info("Sync: follower rebuilt scroll image to match leader new cycle")
+            vc = getattr(self, 'vegas_coordinator', None)
+            if not vc:
+                logger.warning("Sync: follower has no vegas_coordinator — cannot build scroll image")
+                return
+            rp = vc.render_pipeline
+            if not rp:
+                logger.warning("Sync: follower vegas_coordinator has no render_pipeline")
+                return
+            logger.info("Sync: follower starting scroll image rebuild")
+            ok = rp.start_new_cycle()
+            if ok and rp.scroll_helper.cached_image is not None:
+                logger.info(
+                    "Sync: follower scroll image ready — %dx%d",
+                    rp.scroll_helper.cached_image.width,
+                    rp.scroll_helper.cached_image.height,
+                )
+            else:
+                logger.warning(
+                    "Sync: follower scroll image rebuild FAILED (ok=%s, cached=%s)",
+                    ok, rp.scroll_helper.cached_image is not None,
+                )
         except Exception as exc:
-            logger.debug("Sync: follower scroll image rebuild error: %s", exc)
+            logger.warning("Sync: follower scroll image rebuild error: %s", exc, exc_info=True)
 
     def _send_follower_frame(self, plugin_instance) -> None:
         """Leader: generate and send the follower's portion of the current frame.
