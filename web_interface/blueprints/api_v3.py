@@ -994,8 +994,13 @@ def save_main_config():
                        'auto_load_enabled', 'development_mode',
                        'plugins_directory']:
                 continue
-            # Skip display settings that are already handled above (they're in nested structure)
+            # Skip fields that are already handled above in their own named sections.
+            # Without this, every form field name lands as a top-level config key too.
             if key in display_fields:
+                continue
+            if key in sync_fields:
+                continue
+            if key in vegas_fields:
                 continue
             # For any remaining keys (including plugin keys), use deep merge to preserve existing settings
             if key in current_config and isinstance(current_config[key], dict) and isinstance(data[key], dict):
