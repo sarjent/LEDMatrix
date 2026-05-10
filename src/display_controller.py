@@ -1476,14 +1476,20 @@ class DisplayController:
                         if vc and vc.render_pipeline:
                             rp = vc.render_pipeline
                             if rp.scroll_helper.cached_image is not None:
+                                width = self.display_manager.width
                                 sync_cfg = self.config.get("sync", {})
                                 sign = -1 if sync_cfg.get("follower_position", "left") == "left" else 1
-                                rp.scroll_helper.scroll_position = (
-                                    scroll_x + sign * self.display_manager.width
-                                )
-                                frame = rp.scroll_helper.get_visible_portion()
-                                if frame is not None:
-                                    self._follower_last_frame = frame
+                                # Guard: when scroll_x < display_width the leader just
+                                # started a new cycle (reset to display_width). The
+                                # follower's offset would wrap to near the end of the
+                                # image showing unexpected content. Hold the last frame
+                                # until the offset is in the valid forward range.
+                                if scroll_x >= width:
+                                    rp.scroll_helper.scroll_position = scroll_x + sign * width
+                                    frame = rp.scroll_helper.get_visible_portion()
+                                    if frame is not None:
+                                        self._follower_last_frame = frame
+                                # else: scroll_x < display_width → hold last frame
                     else:
                         # Fallback: pixel frame (non-Vegas static content or before
                         # first scroll_x arrives)

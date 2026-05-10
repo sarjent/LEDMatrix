@@ -367,6 +367,13 @@ class RenderPipeline:
         result = self.compose_scroll_content()
 
         if result and self.sync_manager:
+            # When sync is active, start the leader at display_width instead of 0.
+            # This skips the initial black gap so the leader immediately shows content.
+            # The follower starts at position 0 (the gap) which looks like a clean
+            # blank transition rather than near-end content wrapping around.
+            self.scroll_helper.scroll_position = float(self.display_width)
+
+        if result and self.sync_manager:
             # Signal follower that a new cycle started (triggers its own rebuild)
             self.sync_manager.send_new_cycle()
             # Push the actual scroll image over TCP so follower has identical pixels.
