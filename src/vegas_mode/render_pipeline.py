@@ -225,17 +225,14 @@ class RenderPipeline:
             self.display_manager.image = visible_frame
             self.display_manager.update_display()
 
-            # Multi-display sync: send the follower's offset frame as raw bytes.
+            # Multi-display sync: send scroll position to follower.
+            # The follower renders from its own cached_array (kept identical to the
+            # leader's via TCP image transfer at each new_cycle) at scroll_x ± display_width.
             if self.sync_manager:
                 now = time.time()
                 if now - self._last_sync_send >= self._sync_send_interval:
                     self._last_sync_send = now
-                    sign = -1 if self.sync_follower_left else 1
-                    follower_frame = self.scroll_helper.get_portion_at(
-                        self.scroll_helper.scroll_position + sign * self.display_width
-                    )
-                    if follower_frame:
-                        self.sync_manager.send_frame(follower_frame)
+                    self.sync_manager.send_scroll_x(self.scroll_helper.scroll_position)
 
             # Update scrolling state
             self.display_manager.set_scrolling_state(True)
@@ -369,9 +366,18 @@ class RenderPipeline:
         # Compose new scroll content
         result = self.compose_scroll_content()
 
-        # Notify follower to rebuild its own image from fresh data
         if result and self.sync_manager:
+            # Signal follower that a new cycle started (triggers its own rebuild)
             self.sync_manager.send_new_cycle()
+            # Push the actual scroll image over TCP so follower has identical pixels.
+            # Done in a background thread to not block the render loop (~15ms transfer).
+            if self.scroll_helper.cached_image is not None:
+                import threading as _t
+                _t.Thread(
+                    target=self.sync_manager.send_scroll_image,
+                    args=(self.scroll_helper.cached_image,),
+                    daemon=True, name="sync-image-push"
+                ).start()
 
         return result
 

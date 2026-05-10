@@ -443,16 +443,47 @@ class DisplayController:
 
             logger.info("Vegas mode coordinator initialized")
 
-            # Follower: now that Vegas is ready, build the initial scroll image.
-            # We can't wait for the "nc" callback since it fires before plugins
-            # are loaded. Trigger the rebuild directly now that we're ready.
             if self.sync_manager.role == SyncRole.FOLLOWER:
+                # Build initial scroll image now that Vegas is ready.
                 import threading as _t
                 _t.Thread(
                     target=self._follower_rebuild_scroll_image,
-                    daemon=True,
-                    name="sync-follower-init-rebuild"
+                    daemon=True, name="sync-follower-init-rebuild"
                 ).start()
+
+                # When the leader sends its scroll image (TCP), update our
+                # cached_array so both Pis have pixel-identical images.
+                import numpy as _np
+                def _on_leader_scroll_image(image):
+                    vc = getattr(self, 'vegas_coordinator', None)
+                    if vc and vc.render_pipeline:
+                        rp = vc.render_pipeline
+                        arr = _np.asarray(image.convert("RGB"), dtype=_np.uint8)
+                        rp.scroll_helper.cached_image = image
+                        rp.scroll_helper.cached_array = arr
+                        rp.scroll_helper.total_scroll_width = image.width
+                        logger.info(
+                            "Sync: follower adopted leader scroll image %dx%d",
+                            image.width, image.height,
+                        )
+                self.sync_manager.set_on_scroll_image(_on_leader_scroll_image)
+
+            if self.sync_manager.role == SyncRole.LEADER:
+                # When a follower first connects, push the current scroll image so
+                # the follower doesn't have to wait for the next new_cycle event.
+                # Polls until the image is ready (Vegas may still be composing on startup).
+                def _on_follower_connected():
+                    import time as _t
+                    for _ in range(300):  # up to 30s
+                        vc = getattr(self, 'vegas_coordinator', None)
+                        if vc and vc.render_pipeline:
+                            img = vc.render_pipeline.scroll_helper.cached_image
+                            if img is not None:
+                                self.sync_manager.send_scroll_image(img)
+                                return
+                        _t.sleep(0.1)
+                    logger.warning("Sync: no scroll image available to push to new follower")
+                self.sync_manager.set_on_follower_connected(_on_follower_connected)
 
         except Exception as e:
             logger.error("Failed to initialize Vegas mode: %s", e, exc_info=True)
@@ -1445,10 +1476,29 @@ class DisplayController:
                 # Plugin update() threads still run (via _tick_plugin_updates above) so
                 # data is fresh when we return to standalone if the leader goes offline.
                 if self.sync_manager.is_follower_active():
-                    # Render the latest pixel frame received from the leader.
-                    frame = self.sync_manager.get_latest_frame()
-                    if frame is not None:
-                        self._follower_last_frame = frame
+                    # Primary: render locally at leader's scroll position.
+                    # The leader pushed its identical cached_array via TCP, so
+                    # get_portion_at(scroll_x ± display_width) is pixel-accurate.
+                    scroll_x = self.sync_manager.get_latest_scroll_x()
+                    if scroll_x is not None:
+                        vc = getattr(self, 'vegas_coordinator', None)
+                        if vc and vc.render_pipeline:
+                            rp = vc.render_pipeline
+                            if rp.scroll_helper.cached_image is not None:
+                                sync_cfg = self.config.get("sync", {})
+                                sign = -1 if sync_cfg.get("follower_position", "left") == "left" else 1
+                                rp.scroll_helper.scroll_position = (
+                                    scroll_x + sign * self.display_manager.width
+                                )
+                                frame = rp.scroll_helper.get_visible_portion()
+                                if frame is not None:
+                                    self._follower_last_frame = frame
+                    else:
+                        # Fallback: pixel frame (non-Vegas static content or before
+                        # first scroll_x arrives)
+                        frame = self.sync_manager.get_latest_frame()
+                        if frame is not None:
+                            self._follower_last_frame = frame
 
                     display_frame = getattr(self, '_follower_last_frame', None)
                     if display_frame is not None:

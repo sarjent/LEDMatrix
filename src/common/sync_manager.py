@@ -109,6 +109,11 @@ class DisplaySyncManager:
         self._frame_lock = threading.Lock()
         self._leader_ip: Optional[str] = None
         self._on_new_cycle: Optional[callable] = None     # called when leader starts new cycle
+        self._on_scroll_image: Optional[callable] = None  # called with Image when received
+        self._img_server_sock = None                      # TCP server for scroll image transfer
+
+        # Leader state additions
+        self._on_follower_connected: Optional[callable] = None  # called when follower connects
 
         self._error_message: Optional[str] = None
         self._running = False
@@ -190,6 +195,12 @@ class DisplaySyncManager:
                 )
             self._leader_state = LeaderState.CONNECTED
             self._error_message = None
+            # Send scroll image immediately on new connection so follower has identical content
+            if prev_state != LeaderState.CONNECTED and self._on_follower_connected:
+                threading.Thread(
+                    target=self._on_follower_connected,
+                    daemon=True, name="sync-leader-img-push"
+                ).start()
         else:
             self._leader_state = LeaderState.INCOMPATIBLE
             self._error_message = (
@@ -225,6 +236,80 @@ class DisplaySyncManager:
                     self._peer_ip = None
                     self._peer_compatible = False
                     self.write_status_file()
+
+    def _image_server_loop(self) -> None:
+        """Follower: TCP server that receives the leader's scroll image at each new cycle."""
+        while self._running:
+            try:
+                conn, addr = self._img_server_sock.accept()
+                conn.settimeout(10.0)
+                try:
+                    # 4-byte big-endian length prefix
+                    hdr = b""
+                    while len(hdr) < 4:
+                        chunk = conn.recv(4 - len(hdr))
+                        if not chunk:
+                            break
+                        hdr += chunk
+                    if len(hdr) < 4:
+                        continue
+                    length = int.from_bytes(hdr, "big")
+                    data = b""
+                    while len(data) < length:
+                        chunk = conn.recv(min(65536, length - len(data)))
+                        if not chunk:
+                            break
+                        data += chunk
+                    img = Image.open(io.BytesIO(data))
+                    img.load()
+                    self.logger.info(
+                        "Sync: received scroll image %dx%d (%d bytes compressed)",
+                        img.width, img.height, length,
+                    )
+                    if self._on_scroll_image:
+                        self._on_scroll_image(img)
+                finally:
+                    conn.close()
+            except socket.timeout:
+                continue
+            except Exception as exc:
+                self.logger.debug("Sync: image server error: %s", exc)
+
+    def send_scroll_image(self, image: Image.Image) -> None:
+        """Leader: send the full scroll image to the follower via TCP.
+        PNG compression typically reduces a 5000×32 image to ~20–50KB,
+        transferring in <20ms on local WiFi. Called at new_cycle and on
+        first connection so both Pis always have identical cached_arrays.
+        """
+        if self.role != SyncRole.LEADER:
+            return
+        if self._leader_state != LeaderState.CONNECTED or not self._peer_ip:
+            return
+        try:
+            buf = io.BytesIO()
+            image.save(buf, format="PNG", optimize=True)
+            data = buf.getvalue()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5.0)
+            sock.connect((self._peer_ip, self.port + 1))
+            sock.sendall(len(data).to_bytes(4, "big") + data)
+            sock.close()
+            self.logger.info(
+                "Sync: sent scroll image %dx%d (%d bytes compressed)",
+                image.width, image.height, len(data),
+            )
+        except Exception as exc:
+            self.logger.debug("Sync: image send error: %s", exc)
+
+    def set_on_follower_connected(self, callback) -> None:
+        """Leader: callback fired (in a thread) when a compatible follower first connects.
+        Use this to push the current scroll image immediately.
+        """
+        self._on_follower_connected = callback
+
+    def set_on_scroll_image(self, callback) -> None:
+        """Follower: callback fired with the received Image when leader sends scroll image."""
+        self._on_scroll_image = callback
 
     def send_scroll_x(self, scroll_x: float) -> None:
         """Leader (Vegas mode): broadcast scroll position instead of a pixel frame.
@@ -300,10 +385,19 @@ class DisplaySyncManager:
         threading.Thread(
             target=self._follower_watchdog, daemon=True, name="sync-follower-watchdog"
         ).start()
+        # TCP server: receives scroll images from leader (port + 1)
+        self._img_server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._img_server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._img_server_sock.bind(("", self.port + 1))
+        self._img_server_sock.listen(1)
+        self._img_server_sock.settimeout(1.0)
+        threading.Thread(
+            target=self._image_server_loop, daemon=True, name="sync-image-server"
+        ).start()
+
         self.logger.info(
-            "Sync: follower started on UDP port %d — broadcasting hello every %.0fs",
-            self.port,
-            HELLO_INTERVAL,
+            "Sync: follower started on UDP port %d, image server on TCP %d",
+            self.port, self.port + 1,
         )
         self.write_status_file()
 
@@ -499,7 +593,7 @@ class DisplaySyncManager:
     def stop(self) -> None:
         """Shut down threads and close sockets."""
         self._running = False
-        for sock in (self._recv_sock, self._send_sock):
+        for sock in (self._recv_sock, self._send_sock, self._img_server_sock):
             if sock:
                 try:
                     sock.close()
