@@ -92,17 +92,11 @@ class DisplayController:
                     _real_update()
             self.display_manager.update_display = _follower_gated_update
 
-            # Register callback: when leader starts a new cycle, rebuild the
-            # follower's own Vegas scroll image from the same fresh plugin data.
-            # Runs in a daemon thread so it doesn't block the render loop.
-            import threading as _threading
-            def _on_leader_new_cycle():
-                _threading.Thread(
-                    target=self._follower_rebuild_scroll_image,
-                    daemon=True,
-                    name="sync-follower-rebuild"
-                ).start()
-            self.sync_manager.set_on_new_cycle(_on_leader_new_cycle)
+            # Note: _on_new_cycle is NOT registered here. The leader now sends
+            # its actual scroll image via TCP at each new_cycle, so the follower
+            # adopts that image directly via set_on_scroll_image(). Registering
+            # _on_new_cycle would trigger a local rebuild that overwrites the
+            # leader's just-received image with a different locally-built one.
 
         # Initialize Font Manager
         font_time = time.time()
@@ -443,30 +437,27 @@ class DisplayController:
 
             logger.info("Vegas mode coordinator initialized")
 
-            if self.sync_manager.role == SyncRole.FOLLOWER:
-                # Build initial scroll image now that Vegas is ready.
-                import threading as _t
-                _t.Thread(
-                    target=self._follower_rebuild_scroll_image,
-                    daemon=True, name="sync-follower-init-rebuild"
-                ).start()
+            # Follower does NOT build its own initial scroll image — the leader
+            # pushes its image via TCP as soon as set_on_follower_connected fires.
+            # A local build would create a different (wrong) image that could
+            # temporarily replace the leader's correct one.
 
-                # When the leader sends its scroll image (TCP), update our
-                # cached_array so both Pis have pixel-identical images.
-                import numpy as _np
-                def _on_leader_scroll_image(image):
-                    vc = getattr(self, 'vegas_coordinator', None)
-                    if vc and vc.render_pipeline:
-                        rp = vc.render_pipeline
-                        arr = _np.asarray(image.convert("RGB"), dtype=_np.uint8)
-                        rp.scroll_helper.cached_image = image
-                        rp.scroll_helper.cached_array = arr
-                        rp.scroll_helper.total_scroll_width = image.width
-                        logger.info(
-                            "Sync: follower adopted leader scroll image %dx%d",
-                            image.width, image.height,
-                        )
-                self.sync_manager.set_on_scroll_image(_on_leader_scroll_image)
+            # When the leader sends its scroll image (TCP), update our
+            # cached_array so both Pis have pixel-identical images.
+            import numpy as _np
+            def _on_leader_scroll_image(image):
+                vc = getattr(self, 'vegas_coordinator', None)
+                if vc and vc.render_pipeline:
+                    rp = vc.render_pipeline
+                    arr = _np.asarray(image.convert("RGB"), dtype=_np.uint8)
+                    rp.scroll_helper.cached_image = image
+                    rp.scroll_helper.cached_array = arr
+                    rp.scroll_helper.total_scroll_width = image.width
+                    logger.info(
+                        "Sync: follower adopted leader scroll image %dx%d",
+                        image.width, image.height,
+                    )
+            self.sync_manager.set_on_scroll_image(_on_leader_scroll_image)
 
             if self.sync_manager.role == SyncRole.LEADER:
                 # When a follower first connects, push the current scroll image so

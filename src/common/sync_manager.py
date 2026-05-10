@@ -108,9 +108,10 @@ class DisplaySyncManager:
         self._last_leader_frame_time: float = 0.0
         self._frame_lock = threading.Lock()
         self._leader_ip: Optional[str] = None
-        self._on_new_cycle: Optional[callable] = None     # called when leader starts new cycle
-        self._on_scroll_image: Optional[callable] = None  # called with Image when received
-        self._img_server_sock = None                      # TCP server for scroll image transfer
+        self._on_new_cycle: Optional[callable] = None       # called when leader starts new cycle
+        self._on_scroll_image: Optional[callable] = None   # called with Image when received
+        self._pending_scroll_image: Optional[Image.Image] = None  # image received before callback set
+        self._img_server_sock = None                        # TCP server for scroll image transfer
 
         # Leader state additions
         self._on_follower_connected: Optional[callable] = None  # called when follower connects
@@ -268,6 +269,9 @@ class DisplaySyncManager:
                     )
                     if self._on_scroll_image:
                         self._on_scroll_image(img)
+                    else:
+                        # Callback not registered yet (startup race) — cache it
+                        self._pending_scroll_image = img
                 finally:
                     conn.close()
             except socket.timeout:
@@ -304,12 +308,24 @@ class DisplaySyncManager:
     def set_on_follower_connected(self, callback) -> None:
         """Leader: callback fired (in a thread) when a compatible follower first connects.
         Use this to push the current scroll image immediately.
+        If a follower is already connected when this is called, fires right away
+        (handles the race where follower connects during leader startup).
         """
         self._on_follower_connected = callback
+        if self._leader_state == LeaderState.CONNECTED:
+            threading.Thread(
+                target=callback, daemon=True, name="sync-leader-img-push-late"
+            ).start()
 
     def set_on_scroll_image(self, callback) -> None:
-        """Follower: callback fired with the received Image when leader sends scroll image."""
+        """Follower: callback fired with the received Image when leader sends scroll image.
+        If an image was received before this callback was registered (startup race),
+        fires immediately with that cached image.
+        """
         self._on_scroll_image = callback
+        if self._pending_scroll_image is not None:
+            callback(self._pending_scroll_image)
+            self._pending_scroll_image = None
 
     def send_scroll_x(self, scroll_x: float) -> None:
         """Leader (Vegas mode): broadcast scroll position instead of a pixel frame.
