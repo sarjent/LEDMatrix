@@ -103,10 +103,12 @@ class DisplaySyncManager:
 
         # Follower state
         self._follower_state = FollowerState.STANDALONE
-        self._latest_frame: Optional[Image.Image] = None
+        self._latest_frame: Optional[Image.Image] = None  # pixel-frame fallback
+        self._latest_scroll_x: Optional[float] = None    # Vegas scroll position
         self._last_leader_frame_time: float = 0.0
         self._frame_lock = threading.Lock()
         self._leader_ip: Optional[str] = None
+        self._on_new_cycle: Optional[callable] = None     # called when leader starts new cycle
 
         self._error_message: Optional[str] = None
         self._running = False
@@ -224,6 +226,32 @@ class DisplaySyncManager:
                     self._peer_compatible = False
                     self.write_status_file()
 
+    def send_scroll_x(self, scroll_x: float) -> None:
+        """Leader (Vegas mode): broadcast scroll position instead of a pixel frame.
+        The follower renders from its own local pipeline at scroll_x - display_width.
+        ~20 bytes vs ~18KB for raw frames — eliminates all content-change artifacts.
+        """
+        if self.role != SyncRole.LEADER:
+            return
+        if self._leader_state != LeaderState.CONNECTED or not self._peer_ip:
+            return
+        try:
+            msg = json.dumps({"t": "sx", "x": round(scroll_x, 2)}).encode("utf-8")
+            self._send_sock.sendto(msg, (self._peer_ip, self.port))
+        except Exception as exc:
+            self.logger.debug("Sync: scroll_x send error: %s", exc)
+
+    def send_new_cycle(self) -> None:
+        """Leader: signal that a new scroll cycle has started so follower rebuilds its image."""
+        if self.role != SyncRole.LEADER:
+            return
+        if self._leader_state != LeaderState.CONNECTED or not self._peer_ip:
+            return
+        try:
+            self._send_sock.sendto(b'{"t":"nc"}', (self._peer_ip, self.port))
+        except Exception as exc:
+            self.logger.debug("Sync: new_cycle send error: %s", exc)
+
     def send_frame(self, image: Image.Image) -> None:
         """Leader: send a rendered frame to the follower as raw RGB bytes.
         Raw format is orders of magnitude faster than PNG on Pi hardware —
@@ -316,7 +344,8 @@ class DisplaySyncManager:
                     # Control message
                     try:
                         msg = json.loads(data.decode("utf-8"))
-                        if msg.get("t") == "hello_ack":
+                        t = msg.get("t")
+                        if t == "hello_ack":
                             self._leader_ip = sender_ip
                             self._peer_compatible = msg.get("compatible", False)
                             self._error_message = msg.get("error")
@@ -325,9 +354,26 @@ class DisplaySyncManager:
                                     "Sync: leader rejected handshake — %s",
                                     self._error_message,
                                 )
-                            # Update status file so peer_compatible reflects the ack
                             self.write_status_file()
-                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        elif t == "sx":
+                            # Vegas scroll-position sync — tiny message, renders locally
+                            self._latest_scroll_x = float(msg["x"])
+                            self._last_leader_frame_time = time.time()
+                            self._leader_ip = sender_ip
+                            if self._follower_state == FollowerState.STANDALONE:
+                                self._follower_state = FollowerState.FOLLOWER
+                                self.logger.info(
+                                    "Sync: leader active at %s — switching to follower mode",
+                                    sender_ip,
+                                )
+                                self.write_status_file()
+                                if self._on_new_cycle:
+                                    self._on_new_cycle()  # build initial scroll image
+                        elif t == "nc":
+                            # Leader started a new scroll cycle — rebuild local image
+                            if self._on_new_cycle:
+                                self._on_new_cycle()
+                    except (json.JSONDecodeError, UnicodeDecodeError, KeyError):
                         pass
 
             except socket.timeout:
@@ -389,8 +435,18 @@ class DisplaySyncManager:
             and self._follower_state == FollowerState.FOLLOWER
         )
 
+    def get_latest_scroll_x(self) -> Optional[float]:
+        """Follower: return the most recently received Vegas scroll position, or None."""
+        return self._latest_scroll_x
+
+    def set_on_new_cycle(self, callback) -> None:
+        """Follower: register a callback fired when the leader starts a new scroll cycle.
+        Used to trigger a local start_new_cycle() so both Pis rebuild from same fresh data.
+        """
+        self._on_new_cycle = callback
+
     def get_latest_frame(self) -> Optional[Image.Image]:
-        """Follower: return the most recently received frame."""
+        """Follower: return the most recently received pixel frame (non-Vegas fallback)."""
         with self._frame_lock:
             return self._latest_frame
 

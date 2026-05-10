@@ -81,15 +81,28 @@ class DisplayController:
         if self.sync_manager.role == SyncRole.LEADER:
             self.sync_manager.set_leader_width(self.display_manager.width)
 
-        # Follower mode: gate update_display() so background plugin threads
-        # cannot write to hardware — only our render loop is permitted.
+        # Follower mode setup
         if self.sync_manager.role == SyncRole.FOLLOWER:
+            # Gate update_display() so background plugin threads cannot write to
+            # hardware — only our render loop is permitted.
             _real_update = self.display_manager.update_display
             _dm = self.display_manager
             def _follower_gated_update():
                 if getattr(_dm, '_sync_render_allowed', False):
                     _real_update()
             self.display_manager.update_display = _follower_gated_update
+
+            # Register callback: when leader starts a new cycle, rebuild the
+            # follower's own Vegas scroll image from the same fresh plugin data.
+            # Runs in a daemon thread so it doesn't block the render loop.
+            import threading as _threading
+            def _on_leader_new_cycle():
+                _threading.Thread(
+                    target=self._follower_rebuild_scroll_image,
+                    daemon=True,
+                    name="sync-follower-rebuild"
+                ).start()
+            self.sync_manager.set_on_new_cycle(_on_leader_new_cycle)
 
         # Initialize Font Manager
         font_time = time.time()
@@ -705,6 +718,18 @@ class DisplayController:
                 logger.exception("Error running scheduled plugin updates")
 
     _FOLLOWER_SEND_INTERVAL = 1.0 / 90  # raw bytes are cheap; 90fps > follower render rate
+
+    def _follower_rebuild_scroll_image(self) -> None:
+        """Follower: rebuild the local Vegas scroll image when the leader starts a new cycle.
+        Both Pis call start_new_cycle() together so they build from the same fresh plugin data.
+        Runs in a background thread — does not block the 60fps render loop.
+        """
+        try:
+            if self.vegas_coordinator and self.vegas_coordinator.render_pipeline:
+                self.vegas_coordinator.render_pipeline.start_new_cycle()
+                logger.info("Sync: follower rebuilt scroll image to match leader new cycle")
+        except Exception as exc:
+            logger.debug("Sync: follower scroll image rebuild error: %s", exc)
 
     def _send_follower_frame(self, plugin_instance) -> None:
         """Leader: generate and send the follower's portion of the current frame.
@@ -1390,25 +1415,39 @@ class DisplayController:
                 # Plugin update() threads still run (via _tick_plugin_updates above) so
                 # data is fresh when we return to standalone if the leader goes offline.
                 if self.sync_manager.is_follower_active():
-                    # Render the newest leader frame.
-                    # Gate ensures only this block can call update_display() —
-                    # background plugin threads are blocked from the hardware.
-                    frame = self.sync_manager.get_latest_frame()
-                    if frame is not None:
-                        self._follower_last_frame = frame
+                    # Vegas path: leader sends scroll_x, follower renders locally.
+                    # No pixel data crosses the network — content changes on the
+                    # leader are completely invisible because the follower uses its
+                    # own scroll image (rebuilt in sync with the leader's new cycles).
+                    scroll_x = self.sync_manager.get_latest_scroll_x()
+                    if scroll_x is not None and self.vegas_coordinator:
+                        rp = self.vegas_coordinator.render_pipeline
+                        if rp.scroll_helper.cached_image is not None:
+                            sync_cfg = self.config.get("sync", {})
+                            sign = -1 if sync_cfg.get("follower_position", "left") == "left" else 1
+                            rp.scroll_helper.scroll_position = (
+                                scroll_x + sign * self.display_manager.width
+                            )
+                            frame = rp.scroll_helper.get_visible_portion()
+                            if frame is not None:
+                                self._follower_last_frame = frame
+                    else:
+                        # Fallback: pixel frame from leader (non-Vegas static content)
+                        frame = self.sync_manager.get_latest_frame()
+                        if frame is not None:
+                            self._follower_last_frame = frame
+
                     display_frame = getattr(self, '_follower_last_frame', None)
                     if display_frame is not None:
                         self.display_manager.image = display_frame
                         self.display_manager._sync_render_allowed = True
                         self.display_manager.update_display()
                         self.display_manager._sync_render_allowed = False
-                    # Precision deadline: compensate for update_display() cost
-                    # so the render rate stays at exactly 60fps regardless of
-                    # how long the hardware push took.
+                    # Precision deadline timer — keeps render at exactly 60fps
                     _deadline = getattr(self, '_follower_deadline', None)
                     _now = time.perf_counter()
                     if _deadline is None or _now > _deadline + 0.1:
-                        _deadline = _now  # resync after long gap
+                        _deadline = _now
                     _deadline += 1.0 / 60
                     self._follower_deadline = _deadline
                     _sleep = _deadline - time.perf_counter()

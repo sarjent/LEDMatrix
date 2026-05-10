@@ -225,20 +225,15 @@ class RenderPipeline:
             self.display_manager.image = visible_frame
             self.display_manager.update_display()
 
-            # Multi-display sync: send the follower's portion of the Vegas ticker.
-            # Throttled to 30fps — PNG encode/decode at 125fps is too heavy on Pi.
-            # follower_left=True  → negative offset (content already scrolled off leader)
-            # follower_left=False → positive offset (follower is to the right)
+            # Multi-display sync (Vegas mode): send the scroll position to the follower.
+            # The follower renders from its own local Vegas pipeline at
+            # scroll_x - display_width — no pixel data crosses the network, so
+            # start_new_cycle() content changes are completely invisible to the follower.
             if self.sync_manager:
                 now = time.time()
                 if now - self._last_sync_send >= self._sync_send_interval:
                     self._last_sync_send = now
-                    sign = -1 if self.sync_follower_left else 1
-                    follower_frame = self.scroll_helper.get_portion_at(
-                        self.scroll_helper.scroll_position + sign * self.display_width
-                    )
-                    if follower_frame:
-                        self.sync_manager.send_frame(follower_frame)
+                    self.sync_manager.send_scroll_x(self.scroll_helper.scroll_position)
 
             # Update scrolling state
             self.display_manager.set_scrolling_state(True)
@@ -370,7 +365,13 @@ class RenderPipeline:
             return False
 
         # Compose new scroll content
-        return self.compose_scroll_content()
+        result = self.compose_scroll_content()
+
+        # Notify follower to rebuild its own image from fresh data
+        if result and self.sync_manager:
+            self.sync_manager.send_new_cycle()
+
+        return result
 
     def get_current_scroll_info(self) -> Dict[str, Any]:
         """Get current scroll state information."""
