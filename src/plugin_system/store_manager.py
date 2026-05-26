@@ -75,6 +75,7 @@ class PluginStoreManager:
         self.github_token = self._load_github_token()
         self._token_validation_cache = {}  # Cache for token validation results: {token: (is_valid, timestamp, error_message)}
         self._token_validation_cache_timeout = 300  # 5 minutes cache for token validation
+        self.saved_repositories_manager = None  # Optionally set after init for custom-registry update support
 
         # Per-plugin tombstone timestamps for plugins that were uninstalled
         # recently via the UI. Used by the state reconciler to avoid
@@ -1300,7 +1301,20 @@ class PluginStoreManager:
             
             # Install dependencies
             self._install_dependencies(final_path)
-            
+
+            # Write install metadata so update_plugin can find this plugin's source later
+            try:
+                metadata = {
+                    'install_type': 'zip',
+                    'repo_url': repo_url,
+                    'plugin_path': plugin_path or '',
+                    'branch': branch_used or 'main',
+                }
+                with open(final_path / '.plugin_metadata.json', 'w', encoding='utf-8') as mf:
+                    json.dump(metadata, mf, indent=2)
+            except Exception as meta_err:
+                self.logger.debug(f"Could not write install metadata for {plugin_id}: {meta_err}")
+
             branch_info = f" (branch: {branch_used})" if branch_used else ""
             self.logger.info(f"Successfully installed plugin from URL: {plugin_id}{branch_info}")
             result = {
@@ -2087,6 +2101,44 @@ class PluginStoreManager:
                     if metadata.get('install_type') == 'bundled':
                         self.logger.info(f"Plugin {plugin_id} is a bundled plugin; updates are delivered via LEDMatrix itself")
                         return True
+                    elif metadata.get('install_type') == 'zip':
+                        stored_repo_url = metadata.get('repo_url', '')
+                        stored_plugin_path = metadata.get('plugin_path', '')
+                        stored_branch = metadata.get('branch', 'main')
+                        if not stored_repo_url:
+                            self.logger.warning(f"Plugin {plugin_id} has zip metadata but no repo_url; cannot update")
+                            return False
+                        # Fetch remote manifest to compare versions
+                        manifest_rel = f"{stored_plugin_path}/manifest.json" if stored_plugin_path else "manifest.json"
+                        remote_manifest = self._fetch_manifest_from_github(stored_repo_url, stored_branch, manifest_rel, force_refresh=True)
+                        remote_version = remote_manifest.get('version', '') if remote_manifest else ''
+                        local_version = ''
+                        try:
+                            local_manifest_path = plugin_path / "manifest.json"
+                            if local_manifest_path.exists():
+                                with open(local_manifest_path, 'r', encoding='utf-8') as f:
+                                    local_manifest = json.load(f)
+                                local_version = local_manifest.get('version', '')
+                        except Exception:
+                            pass
+                        if local_version and remote_version and local_version == remote_version:
+                            self.logger.info(f"Plugin {plugin_id} already at latest version {local_version}")
+                            return True
+                        if remote_version:
+                            self.logger.info(f"Plugin {plugin_id}: local={local_version or 'unknown'}, remote={remote_version}. Reinstalling...")
+                        else:
+                            self.logger.info(f"Plugin {plugin_id}: could not determine remote version, reinstalling from {stored_repo_url}...")
+                        result = self.install_from_url(
+                            stored_repo_url,
+                            plugin_id=plugin_id,
+                            plugin_path=stored_plugin_path or None,
+                            branch=stored_branch,
+                        )
+                        if result.get('success'):
+                            self.logger.info(f"Successfully updated {plugin_id} from {stored_repo_url}")
+                            return True
+                        self.logger.error(f"Failed to update {plugin_id}: {result.get('error')}")
+                        return False
                 except (OSError, ValueError) as e:
                     self.logger.debug(f"[PluginStore] Could not read metadata for {plugin_id} at {metadata_path}: {e}")
 
@@ -2420,6 +2472,27 @@ class PluginStoreManager:
                     self.logger.error(f"Error reinstalling {plugin_id} from URL: {e}")
             
             if not plugin_info_remote:
+                # Try saved/custom repositories as a fallback (handles ZIP installs without metadata)
+                if self.saved_repositories_manager:
+                    try:
+                        saved_repos = self.saved_repositories_manager.get_registry_repositories()
+                        for repo_info in saved_repos:
+                            custom_registry_url = repo_info.get('url')
+                            if not custom_registry_url:
+                                continue
+                            custom_registry = self.fetch_registry_from_url(custom_registry_url)
+                            if not custom_registry:
+                                continue
+                            custom_plugins = custom_registry.get('plugins', []) or []
+                            match = next((p for p in custom_plugins if p.get('id') == plugin_id), None)
+                            if match:
+                                plugin_info_remote = match
+                                self.logger.info(f"Found {plugin_id} in saved repository {custom_registry_url}")
+                                break
+                    except Exception as e:
+                        self.logger.debug(f"Error searching saved repositories for {plugin_id}: {e}")
+
+            if not plugin_info_remote:
                 self.logger.warning(f"Plugin {plugin_id} not found in registry and not a git repository; cannot update automatically")
                 if not repo_url:
                     self.logger.warning("Plugin may have been installed via ZIP download. Try reinstalling from GitHub URL to enable updates.")
@@ -2451,6 +2524,12 @@ class PluginStoreManager:
             if not self._safe_remove_directory(plugin_path):
                 self.logger.error(f"Failed to remove old plugin directory for {plugin_id}")
                 return False
+            # If the registry entry has a plugin_path it's a monorepo: use install_from_url
+            registry_plugin_path = plugin_info_remote.get('plugin_path', '')
+            if registry_plugin_path and repo_url:
+                branch = plugin_info_remote.get('branch') or 'main'
+                result = self.install_from_url(repo_url, plugin_id=plugin_id, plugin_path=registry_plugin_path, branch=branch)
+                return result.get('success', False)
             return self.install_plugin(registry_id)
 
         except Exception as e:

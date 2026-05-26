@@ -80,6 +80,7 @@ plugin_manager = PluginManager(
 )
 plugin_store_manager = PluginStoreManager(plugins_dir=str(plugins_dir))
 saved_repositories_manager = SavedRepositoriesManager()
+plugin_store_manager.saved_repositories_manager = saved_repositories_manager
 
 # Initialize schema manager
 schema_manager = SchemaManager(
