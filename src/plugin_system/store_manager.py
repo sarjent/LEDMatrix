@@ -2475,7 +2475,7 @@ class PluginStoreManager:
                 # Try saved/custom repositories as a fallback (handles ZIP installs without metadata)
                 if self.saved_repositories_manager:
                     try:
-                        saved_repos = self.saved_repositories_manager.get_registry_repositories()
+                        saved_repos = self.saved_repositories_manager.get_all()
                         for repo_info in saved_repos:
                             custom_registry_url = repo_info.get('url')
                             if not custom_registry_url:
